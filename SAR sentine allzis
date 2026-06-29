@@ -1,0 +1,53 @@
+// 1. FILTERING & PRE-PROCESSING
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filterDate('2025-11-27', '2025-11-29')
+  .filterBounds(geometry)
+  .mosaic()
+  .clip(geometry);
+
+var vv_db = s1.select('VV');
+var vh_db = s1.select('VH');
+
+// 2. KONVERSI LINEAR (Dasar Perhitungan)
+var vv_lin = ee.Image(10).pow(vv_db.divide(10));
+var vh_lin = ee.Image(10).pow(vh_db.divide(10));
+
+// 3. FORMULA-FORMULA
+var ratio_lin = vh_lin.divide(vv_lin).rename('Ratio_Lin');
+var ratio_lin_ke_db = ratio_lin.log10().multiply(10).rename('Ratio_dB');
+
+var formula_kuadrat = vv_lin.add(vh_lin).pow(2).rename('kuadrat_VVVH_Sq');
+var formula_kuadrat_db = formula_kuadrat.log10().multiply(10).rename('kuadrat_dB');
+
+var formula_vh_plus_ratio = vh_lin.add(vh_lin.divide(vv_lin.add(0.0001))).rename('VH_Plus_Ratio_Lin');
+var formula_vh_plus_ratio_db = formula_vh_plus_ratio.log10().multiply(10).rename('VH_Plus_Ratio_dB');
+//vv+vh
+var formula_vv_min_vh = vv_db.add(vh_db).rename('vvplusvh');
+Map.addLayer(
+  formula_vv_min_vh,
+  {min: -25, max: 0,},
+  'VV + VH (dB)'
+);
+var total_scatter_db = vv_lin.add(vh_lin).log10().multiply(10).rename('VV_plus_VH_dB');
+
+
+
+// 4. VISUALISASI
+Map.centerObject(geometry, 12);
+
+// Layer Dasar
+Map.addLayer(vv_db, {min: -20, max: 0}, '1. VV (dB)');
+Map.addLayer(vh_db, {min: -25, max: -5}, '2. VH (dB)');
+
+// Layer Hasil Formula
+//Map.addLayer(ratio_lin_ke_db, {min: -25, max: 0}, '3. Rasio (dB)');
+//Map.addLayer(formula_kuadrat_db, {min: -20, max: 0}, '4. (VV+VH)^2 (dB)');
+//Map.addLayer(formula_vh_plus_ratio_db, {min: -30, max: -5}, '5.VH+(VH/VV) (dB)');
+Map.addLayer(total_scatter_db, {min: -20, max: 0}, '6. VV + VH total(dB)');
+
+// 5. RGB KOMPOSIT
+var rgb_db = ee.Image.cat([vv_db, vh_db, ratio_lin_ke_db,formula_vh_plus_ratio_db,formula_kuadrat_db,total_scatter_db]);
+Map.addLayer(rgb_db, {min: [-20, -25, -10], max: [0, -5, 10]}, 'RGB: VV, VH, Ratio');
