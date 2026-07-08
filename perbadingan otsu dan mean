@@ -1,0 +1,85 @@
+/////////// ini adalah perbadingan otsu dan std mean tahpa masking coencted
+
+
+
+// ===================================================
+// PERBANDINGAN: OTSU VS MEAN-STD DEV (TANPA CONNECTED PIXEL)
+// ===================================================
+
+var geometry = polygon; 
+var before_start = '2025-11-01', before_end = '2025-11-05';
+var after_start  = '2025-11-27', after_end  = '2025-11-29';
+
+// 1. DATA ACQUISITION
+var s1_collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filterBounds(geometry);
+
+var before = s1_collection.filterDate(before_start, before_end).mean().clip(geometry);
+var after  = s1_collection.filterDate(after_start, after_end).mean().clip(geometry);
+
+// Menggunakan Median Filter 3x3 (sesuai permintaan sebelumnya)
+var kernel3x3 = ee.Kernel.rectangle({xRadius: 1, yRadius: 1, units: 'pixels'});
+var before_f = before.focalMedian({kernel: kernel3x3, iterations: 1});
+var after_f  = after.focalMedian({kernel: kernel3x3, iterations: 1});
+
+// 2. SELISIH (SUBTRACT)
+var diff_VH = after_f.select('VH').subtract(before_f.select('VH')).rename('diff');
+var diff_VV = after_f.select('VV').subtract(before_f.select('VV')).rename('diff');
+var diff_Comb = after_f.select('VH').add(after_f.select('VV'))
+                .subtract(before_f.select('VH').add(before_f.select('VV'))).rename('diff');
+
+// 3. FUNGSI OTSU
+var otsu = function(img) {
+  var hist = ee.Dictionary(img.reduceRegion({reducer: ee.Reducer.histogram(255, 2), geometry: geometry, scale: 30, bestEffort: true}).get('diff'));
+  var counts = ee.Array(hist.get('histogram')), means = ee.Array(hist.get('bucketMeans'));
+  var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]), sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+  var mean = sum.divide(total), indices = ee.List.sequence(1, means.length().get([0]));
+  var bss = indices.map(function(i) {
+    var aC = counts.slice(0, 0, i).reduce(ee.Reducer.sum(), [0]).get([0]);
+    var aM = means.slice(0, 0, i).multiply(counts.slice(0, 0, i)).reduce(ee.Reducer.sum(), [0]).get([0]).divide(aC);
+    var bC = total.subtract(aC), bM = sum.subtract(aC.multiply(aM)).divide(bC);
+    return aC.multiply(aM.subtract(mean).pow(2)).add(bC.multiply(bM.subtract(mean).pow(2)));
+  });
+  return means.sort(bss).get([-1]);
+};
+
+// 4. FUNGSI MEAN-STD DEV
+var getMeanStd = function(img) {
+  var stats = img.reduceRegion({reducer: ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true), geometry: geometry, scale: 30, bestEffort: true});
+  return ee.Number(stats.get('diff_mean')).subtract(ee.Number(stats.get('diff_stdDev')).multiply(1.5));
+};
+
+// 5. EKSEKUSI & MASKING (TANPA CONNECTED PIXEL)
+var dem = ee.Image('WWF/HydroSHEDS/03VFDEM');
+var slope = ee.Terrain.slope(dem).lt(5);
+
+var runCompare = function(img, name) {
+  var thOtsu = otsu(img);
+  var thMean = getMeanStd(img);
+  
+  // Deteksi RAW hanya dengan filter slope
+  var banjirOtsu = img.lt(thOtsu).updateMask(slope);
+  var banjirMean = img.lt(thMean).updateMask(slope);
+  
+  Map.addLayer(banjirOtsu.selfMask(), {palette: 'blue'}, name + ' (Otsu Raw)');
+  Map.addLayer(banjirMean.selfMask(), {palette: 'red'}, name + ' (Mean-Std Raw)');
+  
+  // Fungsi Ekspor
+  Export.image.toDrive({
+    image: banjirOtsu.unmask(0), description: 'Banjir_' + name + '_Otsu_Raw',
+    region: geometry, scale: 10, maxPixels: 1e13
+  });
+  Export.image.toDrive({
+    image: banjirMean.unmask(0), description: 'Banjir_' + name + '_MeanStd_Raw',
+    region: geometry, scale: 10, maxPixels: 1e13
+  });
+};
+
+runCompare(diff_VH, 'VH');
+runCompare(diff_VV, 'VV');
+runCompare(diff_Comb, 'Combined');
+
+Map.centerObject(geometry, 12);
