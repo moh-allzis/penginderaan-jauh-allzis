@@ -1,0 +1,11 @@
+spekle median filter dengan ukuran kernel 3x3.
+  // 1. DATA ACQUISITION & SPECKLE FILTERING (Kernel 3x3)
+  var kernel3x3 = ee.Kernel.rectangle({xRadius: 1, yRadius: 1, units: 'pixels'});
+  
+  // Menggunakan focalMedian dengan kernel 3x3
+  var before_filter = before.focalMedian({kernel: kernel3x3, iterations: 1});
+  var after_filter  = after.focalMedian({kernel: kernel3x3, iterations: 1});
+
+//spekele mean filter dengan radius tertentu menggunakan circular kernel (Prasetyo et al., 2025)
+  var before_f = before.focal_median(50, 'circle', 'meters');
+  var after_f  = after.focal_median(50, 'circle', 'meters');
