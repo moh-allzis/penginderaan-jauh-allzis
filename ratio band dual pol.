@@ -1,0 +1,44 @@
+// ============================================================================================
+// ANALISIS FITUR POLARIMETRIK: LINIER, dB (SUBTRACT), DAN dB (CONVERTED)
+// ============================================================================================
+
+// 1. FILTERING & PRE-PROCESSING
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+    .filterBounds(geometry)
+    .filterDate('2025-11-27', '2025-11-30')
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+    .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+    .filter(ee.Filter.eq('instrumentMode', 'IW'))
+    .mean()
+    .clip(geometry);
+
+var s1_linear = ee.Image(10).pow(s1.select(['VH', 'VV']).divide(10));
+    var kernel = ee.Kernel.rectangle({xRadius: 1, yRadius: 1, units: 'pixels'});
+    var s1_filtered = s1_linear.focalMedian({kernel: kernel, iterations: 1});
+
+var vv = s1_filtered.select('VV');
+var vh = s1_filtered.select('VH');
+//ini data set ratio db dan lin
+{
+// 2. KELOMPOK 1: DOMAIN LINIER
+var ratio_linear = vv.divide(vh).rename('Ratio_Linear');
+    var final_linear = ee.Image.cat([vv, vh, ratio_linear]);
+
+Map.addLayer(final_linear, {bands: ['VV', 'VH', 'Ratio_Linear'], min: [0, 0, 0], max: [0.2, 0.2, 25]}, '1. Linear Domain');
+Map.addLayer(ratio_linear, {min: 0, max: 25}, '1.1 Band Ratio (Linear)');
+
+// 3. KELOMPOK 2: DOMAIN dB (METODE SUBTRACT) bagian ini ratio memhggunakan subtark karna dalam db operasi subtract = divide dlm lin maka nilainya akan sama
+var vv_dB = vv.log10().multiply(10).rename('VV_dB');
+var vh_dB = vh.log10().multiply(10).rename('VH_dB');
+    var ratio_dB_subtract = vv_dB.subtract(vh_dB).rename('Ratio_dB_Subtract');
+    var final_dB_subtract = ee.Image.cat([vv_dB, vh_dB, ratio_dB_subtract]);
+
+Map.addLayer(final_dB_subtract, {bands: ['VV_dB', 'VH_dB', 'Ratio_dB_Subtract'], min: [-25, -30, -5], max: [-5, -10, 15]}, '2. dB Domain (Subtract)');
+
+// 4. KELOMPOK 3: DOMAIN dB (METODE KONVERSI LANGSUNG) maksunya hasil dari ratio lin itu diubah ke db dengan rumus
+    var ratio_dB_convert = ratio_linear.log10().multiply(10).rename('Ratio_dB_Converted');
+
+Map.addLayer(ratio_dB_convert, {min: -5, max: 15}, '3. Band Ratio dB (Konversi Langsung)',false);
+}
+
+
