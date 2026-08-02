@@ -1,0 +1,206 @@
+// ===================================================
+// 0. PARAMETER & KERNEL
+// ===================================================
+var kernel3x3 = ee.Kernel.rectangle({
+  xRadius: 1,
+  yRadius: 1,
+  units: 'pixels'
+});
+
+var before_start = '2025-11-01', before_end = '2025-11-05';
+var after_start  = '2025-11-27', after_end  = '2025-11-29';
+
+// ===================================================
+// 1. DATA ACQUISITION & PRE-PROCESSING
+// ===================================================
+var s1_collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filterBounds(geometry);
+
+var before_raw = s1_collection.filterDate(before_start, before_end).mean().clip(geometry);
+var after_raw  = s1_collection.filterDate(after_start,  after_end).mean().clip(geometry);
+
+print('Scene Before:', s1_collection.filterDate(before_start, before_end).aggregate_array('system:id'));
+print('Scene After:',  s1_collection.filterDate(after_start,  after_end).aggregate_array('system:id'));
+
+// ===================================================
+// 2. SPECKLE FILTERING (Median Filter 3×3)
+// ===================================================
+var before_filter = before_raw.focalMedian({kernel: kernel3x3, iterations: 1});
+var after_filter  = after_raw.focalMedian({kernel: kernel3x3, iterations: 1});
+
+// ===================================================
+// 3. PERHITUNGAN INDEKS
+// ===================================================
+// --- Skenario 1: VV tunggal ---
+var VV_before = before_filter.select('VV');
+var VV_after  = after_filter.select('VV');
+
+// --- Skenario 2: VH tunggal ---
+var VH_before = before_filter.select('VH');
+var VH_after  = after_filter.select('VH');
+
+// --- Skenario 3: VH+VV Addition (Islam & Meng 2022, No.3) ---
+var VH_add_VV_before = before_filter.select('VH')
+  .add(before_filter.select('VV')).rename('VHaddVV');
+var VH_add_VV_after  = after_filter.select('VH')
+  .add(after_filter.select('VV')).rename('VHaddVV');
+
+// --- Skenario 4: VH²+VV² Squared Addition (Islam & Meng 2022, No.7) ---
+var VH_sq_add_VV_sq_before = before_filter.select('VH').pow(2)
+  .add(before_filter.select('VV').pow(2)).rename('VHsqAddVVsq');
+var VH_sq_add_VV_sq_after  = after_filter.select('VH').pow(2)
+  .add(after_filter.select('VV').pow(2)).rename('VHsqAddVVsq');
+
+// ===================================================
+// 4. CHANGE DETECTION (CDAT)
+// ===================================================
+var change_VV         = VV_after.subtract(VV_before).rename('change_VV');
+var change_VH         = VH_after.subtract(VH_before).rename('change_VH');
+var change_addition   = VH_add_VV_after.subtract(VH_add_VV_before).rename('change_addition');
+var change_sq_add     = VH_sq_add_VV_sq_after.subtract(VH_sq_add_VV_sq_before).rename('change_sq_add');
+
+// ===================================================
+// 5. THRESHOLD (Mean - 1.5 × StdDev)
+// ===================================================
+function getThreshold(img) {
+  var stats    = img.reduceRegion({
+    reducer: ee.Reducer.mean().combine(ee.Reducer.stdDev(), null, true),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e13,
+    bestEffort: true
+  });
+  var bandName = ee.String(img.bandNames().get(0));
+  var mean     = ee.Number(stats.get(bandName.cat('_mean')));
+  var std      = ee.Number(stats.get(bandName.cat('_stdDev')));
+  return mean.subtract(std.multiply(1.5));
+}
+
+var thresholdVV     = getThreshold(change_VV);
+var thresholdVH     = getThreshold(change_VH);
+var thresholdAdd    = getThreshold(change_addition);
+var thresholdSqAdd  = getThreshold(change_sq_add);
+
+print('=== THRESHOLD ===');
+print('Threshold VV:',             thresholdVV);
+print('Threshold VH:',             thresholdVH);
+print('Threshold VH+VV:',          thresholdAdd);
+print('Threshold VH²+VV²:',        thresholdSqAdd);
+
+// ===================================================
+// 6. KLASIFIKASI AWAL
+// ===================================================
+var banjirVV_raw     = change_VV.lt(thresholdVV);
+var banjirVH_raw     = change_VH.lt(thresholdVH);
+var banjirAdd_raw    = change_addition.lt(thresholdAdd);
+var banjirSqAdd_raw  = change_sq_add.lt(thresholdSqAdd);
+
+// ===================================================
+// 7. MASKING & REFINEMENT
+// ===================================================
+var dem_slope = ee.Image('WWF/HydroSHEDS/03VFDEM');
+var slope     = ee.Terrain.slope(dem_slope);
+
+function applyRefinement(banjir) {
+  // a) Slope mask > 5° (Islam & Meng 2022, UN-SPIDER 2021)
+  var banjir_clean = banjir.updateMask(slope.lt(5));
+  // b) Connected pixels < 8 (Islam & Meng 2022)
+  var connected    = banjir_clean.connectedPixelCount({
+    maxSize: 100, eightConnected: true
+  });
+  return banjir_clean.updateMask(connected.gte(8));
+}
+
+var banjirVV    = applyRefinement(banjirVV_raw);
+var banjirVH    = applyRefinement(banjirVH_raw);
+var banjirAdd   = applyRefinement(banjirAdd_raw);
+var banjirSqAdd = applyRefinement(banjirSqAdd_raw);
+
+// ===================================================
+// 8. HITUNG LUASAN
+// ===================================================
+function hitungLuas(img, nama) {
+  var luas = img.multiply(ee.Image.pixelArea())
+    .reduceRegion({
+      reducer:   ee.Reducer.sum(),
+      geometry:  geometry,
+      scale:     10,
+      maxPixels: 1e13,
+      tileScale: 16
+    });
+  var ha = ee.Number(luas.values().get(0)).divide(10000);
+  print('Luas Banjir ' + nama + ' (Ha):', ha);
+}
+
+print('=== LUASAN BANJIR ===');
+hitungLuas(banjirVV,    'VV');
+hitungLuas(banjirVH,    'VH');
+hitungLuas(banjirAdd,   'VH+VV (Addition)');
+hitungLuas(banjirSqAdd, 'VH²+VV² (Squared Addition)');
+
+// ===================================================
+// 9. VISUALISASI
+// ===================================================
+Map.centerObject(geometry, 12);
+
+// Citra dasar
+Map.addLayer(after_raw.select('VV'),  {min: -20, max: 0},  'Base: VV After (Raw)',  false);
+Map.addLayer(after_raw.select('VH'),  {min: -25, max: -5}, 'Base: VH After (Raw)',  false);
+Map.addLayer(after_filter.select('VV'), {min: -20, max: 0},  'Base: VV After (Filter)', false);
+Map.addLayer(after_filter.select('VH'), {min: -25, max: -5}, 'Base: VH After (Filter)', false);
+
+// Indeks
+Map.addLayer(VH_add_VV_after,        {min: -35, max: -5}, 'Indeks: VH+VV After',     false);
+Map.addLayer(VH_sq_add_VV_sq_after,  {min: 0,   max: 900},'Indeks: VH²+VV² After',  false);
+
+// Change Detection
+Map.addLayer(change_VV,      {min: -5, max: 5, palette: ['black','white']}, 'CDAT: VV',          false);
+Map.addLayer(change_VH,      {min: -5, max: 5, palette: ['black','white']}, 'CDAT: VH',          false);
+Map.addLayer(change_addition,{min: -5, max: 5, palette: ['black','white']}, 'CDAT: VH+VV',       false);
+Map.addLayer(change_sq_add,  {min: -100, max: 100, palette: ['black','white']}, 'CDAT: VH²+VV²', false);
+
+// RAW
+Map.addLayer(banjirVV_raw.selfMask(),    {palette: ['red']},     'Banjir RAW (VV)',          false);
+Map.addLayer(banjirVH_raw.selfMask(),    {palette: ['yellow']},  'Banjir RAW (VH)',          false);
+Map.addLayer(banjirAdd_raw.selfMask(),   {palette: ['#23d6f5']}, 'Banjir RAW (VH+VV)',       false);
+Map.addLayer(banjirSqAdd_raw.selfMask(), {palette: ['#ff69b4']}, 'Banjir RAW (VH²+VV²)',    false);
+
+// FINAL
+Map.addLayer(banjirVV.selfMask(),    {palette: ['red']},     'Banjir FINAL (VV)');
+Map.addLayer(banjirVH.selfMask(),    {palette: ['yellow']},  'Banjir FINAL (VH)');
+Map.addLayer(banjirAdd.selfMask(),   {palette: ['#23d6f5']}, 'Banjir FINAL (VH+VV)');
+Map.addLayer(banjirSqAdd.selfMask(), {palette: ['#ff69b4']}, 'Banjir FINAL (VH²+VV²)');
+
+// Referensi
+Map.addLayer(slope.gt(5).selfMask(), {palette: ['brown']}, 'Mask: Slope > 5°', false);
+
+// ===================================================
+// 10. EKSPOR
+// ===================================================
+function exportImage(image, name) {
+  Export.image.toDrive({
+    image:          image,
+    description:    name,
+    folder:         'GEE_Padang_Banjir',
+    fileNamePrefix: name,
+    region:         geometry,
+    scale:          10,
+    crs:            'EPSG:32747',
+    maxPixels:      1e13
+  });
+}
+
+// Banjir Final
+exportImage(banjirVV.unmask(0),    'Banjir_FINAL_VV');
+exportImage(banjirVH.unmask(0),    'Banjir_FINAL_VH');
+exportImage(banjirAdd.unmask(0),   'Banjir_FINAL_VHaddVV');
+exportImage(banjirSqAdd.unmask(0), 'Banjir_FINAL_VHsqAddVVsq');
+
+// Citra After (untuk referensi visual)
+exportImage(after_filter.select('VV'), 'Citra_After_VV');
+exportImage(after_filter.select('VH'), 'Citra_After_VH');
+exportImage(VH_add_VV_after,           'Citra_After_VHaddVV');
+exportImage(VH_sq_add_VV_sq_after,     'Citra_After_VHsqAddVVsq');
