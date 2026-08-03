@@ -1,0 +1,201 @@
+var collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(geometry)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .filter(ee.Filter.or(
+    ee.Filter.eq('orbitProperties_pass', 'DESCENDING'),
+    ee.Filter.eq('orbitProperties_pass', 'ASCENDING')
+  ));
+  
+  var before = collection.filterDate('2025-11-20', '2025-11-26');
+var after  = collection.filterDate('2025-11-27', '2025-11-29');
+var tgl4 = collection.filterDate('2026-01-12','2026-01-15');
+
+print('Before ImageCollection', before);
+print('After ImageCollection', after);
+print('lagi ImageCollection', tgl4);
+
+var before_image = before.select('VH').mosaic().clip(geometry);
+var after_image  = after.select('VH').mosaic().clip(geometry);
+var lagi_image  = tgl4.select('VH').mosaic().clip(geometry);
+
+
+var before_filtered = ee.Image(toDB(RefinedLee(toNatural(before_image))))
+var after_filtered = ee.Image(toDB(RefinedLee(toNatural(after_image))))
+
+var flood = before_filtered.gt(-20.3).and(after_filtered.lt(-20.3));
+var flood_mask = flood.updateMask(flood.eq(1));
+
+var water = before_filtered.lt(-16).and(after_filtered.lt(-21.5));
+var water_mask = water.updateMask(water.eq(1));
+
+//Map.addLayer(before_image,{min:-25,max:0},'before')
+//Map.addLayer(after_image,{min:-25,max:0},'after')
+Map.addLayer(lagi_image,{min:-25,max:0},'tgl4')
+Map.addLayer(water_mask,{palette:['Blue']},'Water')
+Map.addLayer(flood_mask,{palette:['Red']},'Flood_mask')
+Map.addLayer(before_filtered,{min:-25,max:0},'before_filtered')
+Map.addLayer(after_filtered,{min:-25,max:0},'after_filtered')
+
+
+//############################
+// Speckle Filtering Functions
+//############################
+
+// Function to convert from d
+function toNatural(img) {
+  return ee.Image(10.0).pow(img.select(0).divide(10.0));
+}
+
+//Function to convert to dB
+function toDB(img) {
+  return ee.Image(img).log10().multiply(10.0);
+}
+
+//Apllying a Refined Lee Speckle filter as coded in the SNAP 3.0 S1TBX:
+
+//https://github.com/senbox-org/s1tbx/blob/master/s1tbx-op-sar-processing/src/main/java/org/esa/s1tbx/sar/gpf/filtering/SpeckleFilters/RefinedLee.java
+//Adapted by Guido Lemoine
+
+// by Guido Lemoine
+function RefinedLee(img) {
+  // img must be in natural units, i.e. not in dB!
+  // Set up 3x3 kernels 
+  var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+  var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+
+  var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+  var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+
+  // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+  var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+
+  var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+
+  // Calculate mean and variance for the sampled windows and store as 9 bands
+  var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+  var sample_var = variance3.neighborhoodToBands(sample_kernel);
+
+  // Determine the 4 gradients for the sampled windows
+  var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+  gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+  gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+  gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+
+  // And find the maximum gradient amongst gradient bands
+  var max_gradient = gradients.reduce(ee.Reducer.max());
+
+  // Create a mask for band pixels that are the maximum gradient
+  var gradmask = gradients.eq(max_gradient);
+
+  // duplicate gradmask bands: each gradient represents 2 directions
+  gradmask = gradmask.addBands(gradmask);
+
+  // Determine the 8 directions
+  var directions = sample_mean.select(1).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(7))).multiply(1);
+  directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(2))).multiply(2));
+  directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(5))).multiply(3));
+  directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4)).gt(sample_mean.select(4).subtract(sample_mean.select(8))).multiply(4));
+  // The next 4 are the not() of the previous 4
+  directions = directions.addBands(directions.select(0).not().multiply(5));
+  directions = directions.addBands(directions.select(1).not().multiply(6));
+  directions = directions.addBands(directions.select(2).not().multiply(7));
+  directions = directions.addBands(directions.select(3).not().multiply(8));
+
+  // Mask all values that are not 1-8
+  directions = directions.updateMask(gradmask);
+
+  // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+  directions = directions.reduce(ee.Reducer.sum());  
+
+  //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+  //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+
+  var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+
+  // Calculate localNoiseVariance
+  var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+
+  // Set up the 7*7 kernels for directional statistics
+  var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+
+  var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+    [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+
+  var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+  var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+
+  // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+  var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+  var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+
+  dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+  dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+
+  // and add the bands for rotated kernels
+  for (var i=1; i<4; i++) {
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+  }
+
+  // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+  dir_mean = dir_mean.reduce(ee.Reducer.sum());
+  dir_var = dir_var.reduce(ee.Reducer.sum());
+
+  // A finally generate the filtered value
+  var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+
+  var b = varX.divide(dir_var);
+
+  var result = dir_mean.add(b.multiply(img.subtract(dir_mean)));
+  return(result.arrayFlatten([['sum']]));
+}
+
+
+var before_vals = before_filtered.reduceRegion({
+  reducer: ee.Reducer.histogram(255),
+  geometry: geometry,
+  scale: 10,
+  bestEffort: true
+});
+
+print('Histogram Before', before_vals);
+
+var after_vals = after_filtered.reduceRegion({
+  reducer: ee.Reducer.histogram(255),
+  geometry: geometry,
+  scale: 10,
+  bestEffort: true
+});
+
+print('Histogram After', after_vals);
+
+
+var s1img = ee.ImageCollection('COPERNICUS/S1_GRD')
+                  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+                  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+                  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+                  .filterBounds(geometry)
+                  .filterDate('2025-11-27', '2025-11-30');
+
+var s1imgVV = s1img.select('VV');
+var s1imgVH = s1img.select('VH');
+print(s1imgVV.size());
+s1imgVV = s1imgVV.mean();
+s1imgVH = s1imgVH.mean();
+
+var s2img = ee.ImageCollection('COPERNICUS/S2_HARMONIZED')
+                  .filterBounds(geometry)
+                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 100))
+                  .filterDate('2025-11-27', '2025-12-30');
+
+var s2imgbands = s2img.select('B4', 'B3', 'B2');
+print(s2imgbands.size());
+s2imgbands = s2imgbands.mean();
+
+Map.centerObject(geometry, 13);
+Map.addLayer(s2imgbands, {min: 240, max: 2300}, 'Sentinel-2');
+Map.addLayer(s1imgVV, {min: -24, max: -1.5}, 'Sentinel-1 VV');
+Map.addLayer(s1imgVH, {min: -31, max: -10}, 'Sentinel-1 VH');
